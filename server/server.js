@@ -161,10 +161,30 @@ app.use('/api/pdf', require('./routes/pdfRoutes'));
 app.use('/api/audio', require('./routes/audioRoutes'));
 app.use('/api/webgl', require('./routes/webglRoutes'));
 
-// Basic route
-app.get('/', (req, res) => {
+// Define API routes before the "catch all" route
+app.get('/api', (req, res) => {
   res.send('API is running...');
 });
+
+// Serve static assets if in production
+const clientBuildPath = path.join(__dirname, 'build');
+
+// Check if build directory exists
+if (fs.existsSync(clientBuildPath)) {
+  // Set static folder
+  app.use(express.static(clientBuildPath));
+
+  // Any route that doesn't match API routes will be redirected to index.html
+  app.get('*', (req, res) => {
+    res.sendFile(path.resolve(clientBuildPath, 'index.html'));
+  });
+} else {
+  console.warn('Build directory not found in server folder. Frontend will not be served.');
+  // Basic route when client build is not available
+  app.get('/', (req, res) => {
+    res.send('API is running... Build directory not found.');
+  });
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
