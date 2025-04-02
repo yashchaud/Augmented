@@ -1,6 +1,11 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:5000/api';
+// Make API URL dynamic based on environment
+// In production, use the same host that serves the frontend
+// In development, use localhost
+const API_URL = (process.env.NODE_ENV === 'production' || window.location.hostname !== 'localhost')
+  ? `${window.location.origin}/api`
+  : 'http://localhost:5000/api';
 
 const api = axios.create({
   baseURL: API_URL,
