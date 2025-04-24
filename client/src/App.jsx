@@ -236,12 +236,15 @@ app.get("/iclock/cdata", async (req, res) => {
     const deviceExists = await new Promise((resolve, reject) => {
       db.get(`SELECT sn FROM Devices WHERE sn = ?`, [SN], (err, row) => {
         if (err) {
+          console.error(`[${SN}] Error checking device existence:`, err.message);
           reject(err);
         } else {
           resolve(!!row);
         }
       });
     });
+
+    logger(`[${SN}] Device exists check: ${deviceExists ? 'Yes' : 'No'}`);
 
     // Update device last seen time in Devices table
     db.run(
@@ -258,7 +261,7 @@ app.get("/iclock/cdata", async (req, res) => {
                 try {
                   // Get all existing users
                   const users = await new Promise((resolve, reject) => {
-                    db.all(`SELECT userPin, name FROM users`, [], (err, rows) => {
+                    db.all(`SELECT userPin, name, photo FROM users ORDER BY userPin`, [], (err, rows) => {
                       if (err) reject(err);
                       else resolve(rows);
                     });
@@ -273,14 +276,32 @@ app.get("/iclock/cdata", async (req, res) => {
                     users.forEach((user, index) => {
                       const cmdSeq = String(index + 1).padStart(2, '0');
                       const sanitizedName = user.name.replace(/[\t\n\r]/g, ' ');
+                      
+                      // Add user data command
                       commandStrings.push(`C:${batchId}${cmdSeq}:DATA USER PIN=${user.userPin}\tName=${sanitizedName}\tPri=0`);
+                      
+                      // Add photo if available
+                      if (user.photo) {
+                        try {
+                          const photoBuffer = Buffer.from(user.photo, 'base64');
+                          const photoSize = photoBuffer.length;
+                          const photoSeq = String(index + 1).padStart(2, '0') + 'p'; // Add 'p' suffix for photo commands
+                          commandStrings.push(`C:${batchId}${photoSeq}:DATA UPDATE BIOPHOTO PIN=${user.userPin}\tFID=1\tNo=0\tIndex=0\tType=2\tFormat=0\tSize=${photoSize}\tContent=${user.photo}`);
+                        } catch (photoErr) {
+                          console.error(`[${SN}] Error preparing photo for user ${user.userPin}:`, photoErr.message);
+                          // Continue without photo if there's an error
+                        }
+                      }
                     });
                     
                     // Queue all commands for this new device
                     if (commandStrings.length > 0) {
-                      await addCommandsToQueue(commandStrings);
-                      logger(`[${SN}] Queued ${commandStrings.length} user sync commands for new device.`);
+                      logger(`[${SN}] Prepared ${commandStrings.length} sync commands, adding to queue...`);
+                      const addedCommands = await addCommandsToQueue(commandStrings);
+                      logger(`[${SN}] Successfully queued ${addedCommands ? addedCommands.length : 0} user sync commands for new device.`);
                     }
+                  } else {
+                    logger(`[${SN}] No users found to sync with new device.`);
                   }
                 } catch (syncError) {
                   console.error(`[${SN}] Error queueing user sync for new device:`, syncError);
@@ -606,42 +627,66 @@ async function addCommandsToQueue(newCommandStrings) {
     try {
         // Get current list (or empty array)
         const currentCommandObjects = await getValueByKey("commands") || [];
+        logger(`Current command queue has ${currentCommandObjects.length} commands`);
         
         // Create new objects with UUIDs
-        const commandObjectsToAdd = newCommandStrings.map(cmdStr => ({
-            uuid: randomUUID(),
-            command: cmdStr,
-            createdAt: new Date().toISOString(), // Add creation timestamp for better tracking
-            userPin: extractUserPinFromCommand(cmdStr) // Extract userPin for easier management
-        }));
+        const commandObjectsToAdd = newCommandStrings.map(cmdStr => {
+            const userPin = extractUserPinFromCommand(cmdStr);
+            return {
+                uuid: randomUUID(),
+                command: cmdStr,
+                createdAt: new Date().toISOString(),
+                userPin: userPin // Store extracted userPin
+            };
+        });
+
+        // Debug log for each command
+        commandObjectsToAdd.forEach(cmd => {
+            logger(`Adding command for userPin=${cmd.userPin}: ${cmd.command.substring(0, 50)}...`);
+        });
 
         if (commandObjectsToAdd.length > 0) {
             // Filter out old commands for users that have new commands
-            // This ensures we replace old commands for existing users
             let filteredCommands = [...currentCommandObjects];
+            let replacedCount = 0;
             
-            commandObjectsToAdd.forEach(newCmd => {
+            for (const newCmd of commandObjectsToAdd) {
                 if (newCmd.userPin) {
-                    // Filter out any existing commands for this userPin
-                    filteredCommands = filteredCommands.filter(cmd => 
-                        !(cmd.userPin === newCmd.userPin && 
-                          // Only replace commands of same type (USER or BIOPHOTO)
-                          cmd.command.includes(newCmd.command.includes('BIOPHOTO') ? 'BIOPHOTO' : 'DATA USER')
-                        )
-                    );
+                    const originalLength = filteredCommands.length;
+                    
+                    // Determine command type
+                    const isUserData = newCmd.command.includes('DATA USER');
+                    const isBioPhoto = newCmd.command.includes('BIOPHOTO');
+                    const isDeleteUser = newCmd.command.includes('DELETE USER');
+                    
+                    // Filter based on command type
+                    filteredCommands = filteredCommands.filter(cmd => {
+                        // Skip if no userPin match
+                        if (cmd.userPin !== newCmd.userPin) return true;
+                        
+                        // Keep if command types don't match
+                        if (isUserData && !cmd.command.includes('DATA USER')) return true;
+                        if (isBioPhoto && !cmd.command.includes('BIOPHOTO')) return true;
+                        if (isDeleteUser && !cmd.command.includes('DELETE USER')) return true;
+                        
+                        // Remove if same userPin and same command type
+                        logger(`Replacing old command for userPin=${cmd.userPin}: ${cmd.command.substring(0, 50)}...`);
+                        return false;
+                    });
+                    
+                    replacedCount += originalLength - filteredCommands.length;
                 }
-            });
+            }
             
             // Add new commands to the filtered list
             const updatedCommands = [...filteredCommands, ...commandObjectsToAdd];
             
-            // Save the updated list back to KeyValueStore, using null for userpin
+            // Save the updated list back to KeyValueStore, using null for userpin parameter
             await setKeyValue("commands", updatedCommands, null);
-            logger(`Added ${commandObjectsToAdd.length} new command(s) to the global queue. Replaced ${currentCommandObjects.length - filteredCommands.length} old commands.`);
+            logger(`Command queue updated: Added ${commandObjectsToAdd.length} new command(s), replaced ${replacedCount} old commands. New total: ${updatedCommands.length}`);
             
             // Also log commands to commands_log table with 'pending' status for tracking
-            // This enables viewing command history even before devices request them
-            commandObjectsToAdd.forEach(cmdObj => {
+            for (const cmdObj of commandObjectsToAdd) {
                 db.run(
                     `INSERT OR IGNORE INTO commands_log (command, command_uuid, status, created_at) 
                      VALUES (?, ?, 'pending', datetime('now'))`,
@@ -650,7 +695,10 @@ async function addCommandsToQueue(newCommandStrings) {
                         if (err) console.error(`Error logging pending command ${cmdObj.uuid}:`, err.message);
                     }
                 );
-            });
+            }
+            
+            // Return the command objects that were added
+            return commandObjectsToAdd;
         }
     } catch (error) {
         logger("Error adding commands to queue:", error);
@@ -660,16 +708,21 @@ async function addCommandsToQueue(newCommandStrings) {
 
 // Helper function to extract userPin from command string
 function extractUserPinFromCommand(cmdStr) {
-    // Skip this for non-user commands
-    if (!cmdStr || (!cmdStr.includes('DATA USER') && !cmdStr.includes('BIOPHOTO') && !cmdStr.includes('DELETE USER'))) {
-        return null;
-    }
+    if (!cmdStr) return null;
     
-    // Matches PIN=12345 in various command formats with tab or space after
+    // Skip this for non-user commands
+    const isUserCommand = cmdStr.includes('DATA USER') || 
+                         cmdStr.includes('BIOPHOTO') || 
+                         cmdStr.includes('DELETE USER');
+                         
+    if (!isUserCommand) return null;
+    
+    // Matches PIN=12345 in various command formats
     const pinMatch = cmdStr.match(/PIN=(\d+)(?:[\t\s]|$)/);
     if (pinMatch && pinMatch[1]) {
-        logger(`Extracted userPin ${pinMatch[1]} from command`);
-        return pinMatch[1];
+        const pin = pinMatch[1];
+        logger(`Extracted userPin ${pin} from command`);
+        return pin;
     }
     
     // Log if we failed to extract a PIN from what appears to be a user command
