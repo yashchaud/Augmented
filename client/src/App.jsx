@@ -593,18 +593,38 @@ async function addCommandsToQueue(newCommandStrings) {
     try {
         // Get current list (or empty array)
         const currentCommandObjects = await getValueByKey("commands") || [];
+        
         // Create new objects with UUIDs
         const commandObjectsToAdd = newCommandStrings.map(cmdStr => ({
             uuid: randomUUID(),
             command: cmdStr,
-            createdAt: new Date().toISOString() // Add creation timestamp for better tracking
+            createdAt: new Date().toISOString(), // Add creation timestamp for better tracking
+            userPin: extractUserPinFromCommand(cmdStr) // Extract userPin for easier management
         }));
 
         if (commandObjectsToAdd.length > 0) {
-            const updatedCommands = [...currentCommandObjects, ...commandObjectsToAdd];
+            // Filter out old commands for users that have new commands
+            // This ensures we replace old commands for existing users
+            let filteredCommands = [...currentCommandObjects];
+            
+            commandObjectsToAdd.forEach(newCmd => {
+                if (newCmd.userPin) {
+                    // Filter out any existing commands for this userPin
+                    filteredCommands = filteredCommands.filter(cmd => 
+                        !(cmd.userPin === newCmd.userPin && 
+                          // Only replace commands of same type (USER or BIOPHOTO)
+                          cmd.command.includes(newCmd.command.includes('BIOPHOTO') ? 'BIOPHOTO' : 'DATA USER')
+                        )
+                    );
+                }
+            });
+            
+            // Add new commands to the filtered list
+            const updatedCommands = [...filteredCommands, ...commandObjectsToAdd];
+            
             // Save the updated list back to KeyValueStore, using null for userpin
             await setKeyValue("commands", updatedCommands, null);
-            logger(`Added ${commandObjectsToAdd.length} new command(s) to the global queue.`);
+            logger(`Added ${commandObjectsToAdd.length} new command(s) to the global queue. Replaced ${currentCommandObjects.length - filteredCommands.length} old commands.`);
             
             // Also log commands to commands_log table with 'pending' status for tracking
             // This enables viewing command history even before devices request them
@@ -623,6 +643,13 @@ async function addCommandsToQueue(newCommandStrings) {
         logger("Error adding commands to queue:", error);
         throw error; // Re-throw for caller handling
     }
+}
+
+// Helper function to extract userPin from command string
+function extractUserPinFromCommand(cmdStr) {
+    // Matches PIN=12345 in various command formats
+    const pinMatch = cmdStr.match(/PIN=(\d+)/);
+    return pinMatch ? pinMatch[1] : null;
 }
 
 // Check if user exists by userPin in 'users' table
