@@ -8,6 +8,7 @@ const { randomUUID } = require("crypto");
 const sharp = require("sharp");
 const cors = require("cors");
 const querystring = require('querystring'); // Keep this for devicecmd parsing
+const https = require('https'); // Import HTTPS module
 
 // Initialize Express app
 const app = express();
@@ -1065,11 +1066,22 @@ app.get("/api/command-log", (req, res) => {
 
 // --- Server Start ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  logger(`Server running on http://0.0.0.0:${PORT}`);
+const HTTPS_PORT = process.env.HTTPS_PORT || 3443; // Use 3443 for HTTPS
+
+// Read SSL certificate files
+const httpsOptions = {
+  key: fs.readFileSync(path.join(__dirname, 'certs', 'localhost+1-key.pem')),
+  cert: fs.readFileSync(path.join(__dirname, 'certs', 'localhost+1.pem'))
+};
+
+// Create HTTPS server
+https.createServer(httpsOptions, app).listen(HTTPS_PORT, '0.0.0.0', () => {
+  logger(`Server running securely on https://0.0.0.0:${HTTPS_PORT}`);
 });
 
 // --- Graceful Shutdown ---
+// NOTE: We might need to adjust shutdown logic if we were running both HTTP and HTTPS servers
+// For now, this targets the process which will close the listening server.
 process.on("SIGINT", () => {
   logger("SIGINT received: Closing database...");
   db.close((err) => {
