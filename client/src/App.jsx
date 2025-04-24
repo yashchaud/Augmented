@@ -232,6 +232,17 @@ app.get("/iclock/cdata", async (req, res) => {
 
     logger(`[${SN}] GET /iclock/cdata request received from ${ipAddress}`);
 
+    // First check if device exists
+    const deviceExists = await new Promise((resolve, reject) => {
+      db.get(`SELECT sn FROM Devices WHERE sn = ?`, [SN], (err, row) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(!!row);
+        }
+      });
+    });
+
     // Update device last seen time in Devices table
     db.run(
         `INSERT INTO Devices (sn, last_seen, ip_address) VALUES (?, datetime('now'), ?)
@@ -240,39 +251,41 @@ app.get("/iclock/cdata", async (req, res) => {
         async function(err) {
             if (err) {
               console.error(`[${SN}] Error updating device last seen:`, err.message);
-            } else if (this.changes > 0) {
-              // Check if this is a new device registration (new row inserted vs updated)
-              // For new devices, queue all existing users to be synchronized
-              try {
-                // Get all existing users
-                const users = await new Promise((resolve, reject) => {
-                  db.all(`SELECT userPin, name FROM users`, [], (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
+            } else {
+              // If device is new (not previously registered)
+              if (!deviceExists) {
+                logger(`[${SN}] This is a NEW device joining the network. Syncing all users...`);
+                try {
+                  // Get all existing users
+                  const users = await new Promise((resolve, reject) => {
+                    db.all(`SELECT userPin, name FROM users`, [], (err, rows) => {
+                      if (err) reject(err);
+                      else resolve(rows);
+                    });
                   });
-                });
 
-                if (users && users.length > 0) {
-                  logger(`[${SN}] New device detected. Queueing ${users.length} users for sync.`);
-                  const commandStrings = [];
-                  const batchId = randomUUID().substring(0, 8);
-                  
-                  // Create a command for each user
-                  users.forEach((user, index) => {
-                    const cmdSeq = String(index + 1).padStart(2, '0');
-                    const sanitizedName = user.name.replace(/[\t\n\r]/g, ' ');
-                    commandStrings.push(`C:${batchId}${cmdSeq}:DATA USER PIN=${user.userPin}\tName=${sanitizedName}\tPri=0`);
-                  });
-                  
-                  // Queue all commands for this new device
-                  if (commandStrings.length > 0) {
-                    await addCommandsToQueue(commandStrings);
-                    logger(`[${SN}] Queued ${commandStrings.length} user sync commands for new device.`);
+                  if (users && users.length > 0) {
+                    logger(`[${SN}] New device detected. Queueing ${users.length} users for sync.`);
+                    const commandStrings = [];
+                    const batchId = randomUUID().substring(0, 8);
+                    
+                    // Create a command for each user
+                    users.forEach((user, index) => {
+                      const cmdSeq = String(index + 1).padStart(2, '0');
+                      const sanitizedName = user.name.replace(/[\t\n\r]/g, ' ');
+                      commandStrings.push(`C:${batchId}${cmdSeq}:DATA USER PIN=${user.userPin}\tName=${sanitizedName}\tPri=0`);
+                    });
+                    
+                    // Queue all commands for this new device
+                    if (commandStrings.length > 0) {
+                      await addCommandsToQueue(commandStrings);
+                      logger(`[${SN}] Queued ${commandStrings.length} user sync commands for new device.`);
+                    }
                   }
+                } catch (syncError) {
+                  console.error(`[${SN}] Error queueing user sync for new device:`, syncError);
+                  // Continue with normal response even if sync queueing fails
                 }
-              } catch (syncError) {
-                console.error(`[${SN}] Error queueing user sync for new device:`, syncError);
-                // Continue with normal response even if sync queueing fails
               }
             }
         }
@@ -647,9 +660,24 @@ async function addCommandsToQueue(newCommandStrings) {
 
 // Helper function to extract userPin from command string
 function extractUserPinFromCommand(cmdStr) {
-    // Matches PIN=12345 in various command formats
-    const pinMatch = cmdStr.match(/PIN=(\d+)/);
-    return pinMatch ? pinMatch[1] : null;
+    // Skip this for non-user commands
+    if (!cmdStr || (!cmdStr.includes('DATA USER') && !cmdStr.includes('BIOPHOTO') && !cmdStr.includes('DELETE USER'))) {
+        return null;
+    }
+    
+    // Matches PIN=12345 in various command formats with tab or space after
+    const pinMatch = cmdStr.match(/PIN=(\d+)(?:[\t\s]|$)/);
+    if (pinMatch && pinMatch[1]) {
+        logger(`Extracted userPin ${pinMatch[1]} from command`);
+        return pinMatch[1];
+    }
+    
+    // Log if we failed to extract a PIN from what appears to be a user command
+    if (cmdStr.includes('PIN=')) {
+        logger(`Warning: Failed to extract userPin from command: ${cmdStr.substring(0, 50)}...`);
+    }
+    
+    return null;
 }
 
 // Check if user exists by userPin in 'users' table
@@ -697,80 +725,112 @@ app.post("/api/register-user", upload.single("photo"), async (req, res) => {
  
   // --- Check User Existence in central DB ---
   try {
-      const exists = await checkUserExistsInUsersTable(userPin);
-      if (exists) {
-          logger(`API /api/register-user: User PIN ${userPin} already exists in users table.`);
-          return res.status(409).json({ error: `User PIN ${userPin} already exists.` }); // 409 Conflict
+      const userExists = await checkUserExistsInUsersTable(userPin);
+      if (userExists) {
+          logger(`API /api/register-user: User PIN ${userPin} already exists in users table. Updating.`);
+          // Update existing user info
+          await new Promise((resolve, reject) => {
+              db.run(`UPDATE users SET name = ?, email = ? WHERE userPin = ?`, 
+                [name, req.body.email, userPin], function(err) {
+                  if (err) reject(err);
+                  else resolve();
+              });
+          });
+      }
+
+      // --- Process Photo ---
+      try {
+        let inputFilePath = null;
+        if (base64) { // Handle base64 input
+            const matches = base64.match(/^data:(image\/(.+));base64,(.+)$/);
+            if (!matches) return res.status(400).json({ message: "Invalid Base64 image format." });
+            const [, mimeType, extension, base64Data] = matches;
+            inputFilePath = path.join(uploadDir, `${randomUUID()}.${extension}`);
+            fs.writeFileSync(inputFilePath, Buffer.from(base64Data, 'base64'));
+            cleanupPaths.push(inputFilePath);
+        } else if (req.file) { // Handle file upload input
+            inputFilePath = req.file.path;
+            cleanupPaths.push(inputFilePath);
+        }
+
+        // --- Optimize Photo if provided ---
+        if (inputFilePath) {
+            const optimizedPhotoPath = path.join(uploadDir, `optimized-${path.basename(inputFilePath)}.jpg`);
+            cleanupPaths.push(optimizedPhotoPath);
+            await sharp(inputFilePath)
+                .resize(200, 200, { fit: 'cover' })
+                .toFormat("jpg")
+                .jpeg({ quality: 75, chromaSubsampling: "4:2:0" })
+                .toFile(optimizedPhotoPath);
+            photoBase64 = fs.readFileSync(optimizedPhotoPath).toString("base64");
+            logger(`API /api/register-user: Photo processed for PIN ${userPin}`);
+        }
+
+        // --- Add or Update User in central 'users' DB ---
+        if (userExists) {
+            // If we have a photo, update it
+            if (photoBase64) {
+                await new Promise((resolve, reject) => {
+                    db.run(`UPDATE users SET photo = ? WHERE userPin = ?`, 
+                        [photoBase64, userPin], function(err) {
+                            if (err) reject(err);
+                            else resolve();
+                        });
+                });
+            }
+        } else {
+            // Add new user
+            await addUserToUsersTable(userPin, name, req.body.email, photoBase64);
+        }
+
+        // --- Prepare Device Command Strings ---
+        const commandStrings = [];
+        // Generate a unique ID part for this batch of commands
+        const commandIdPart = randomUUID().substring(0, 8);
+        const sanitizedName = name.replace(/[\t\n\r]/g, ' '); // Sanitize name
+        
+        // Command to add/update user info - making sure it's distinct for this user
+        const userCommand = `C:${commandIdPart}01:DATA USER PIN=${userPin}\tName=${sanitizedName}\tPri=0`;
+        commandStrings.push(userCommand);
+
+        // Command to add/update the biometric photo (if available)
+        if (photoBase64) {
+          // Calculate size from the *buffer* before base64 encoding for accuracy
+          const photoBuffer = Buffer.from(photoBase64, 'base64');
+          const photoSize = photoBuffer.length;
+          const photoCommand = `C:${commandIdPart}02:DATA UPDATE BIOPHOTO PIN=${userPin}\tFID=1\tNo=0\tIndex=0\tType=2\tFormat=0\tSize=${photoSize}\tContent=${photoBase64}`;
+          commandStrings.push(photoCommand);
+        }
+
+        // --- Queue Commands for Devices ---
+        await addCommandsToQueue(commandStrings);
+
+        // --- Respond to API Client ---
+        logger(`API /api/register-user: Queued ${commandStrings.length} commands for PIN ${userPin}.`);
+        res.status(200).json({ 
+            message: userExists ? "User update queued." : "User registration queued.", 
+            userPin: userPin,
+            commandCount: commandStrings.length
+        });
+
+      } catch (error) {
+        logger(`API /api/register-user: Error processing registration for PIN ${userPin}:`, error);
+        res.status(500).json({ error: "Failed to process registration." });
+      } finally {
+        // --- Cleanup Temporary Files ---
+        cleanupPaths.forEach(fp => {
+            try {
+                if (fs.existsSync(fp)) {
+                    fs.unlinkSync(fp);
+                }
+            } catch (err) {
+                logger(`Warn: Failed to delete temp file ${fp}: ${err.message}`);
+            }
+        });
       }
   } catch (error) {
       logger(`API /api/register-user: DB error checking user PIN ${userPin}:`, error);
       return res.status(500).json({ error: "Database error checking user." });
-  }
-
-  // --- Process Photo ---
-  try {
-    let inputFilePath = null;
-    if (base64) { // Handle base64 input
-        const matches = base64.match(/^data:(image\/(.+));base64,(.+)$/);
-        if (!matches) return res.status(400).json({ message: "Invalid Base64 image format." });
-        const [, mimeType, extension, base64Data] = matches;
-        inputFilePath = path.join(uploadDir, `${randomUUID()}.${extension}`);
-        fs.writeFileSync(inputFilePath, Buffer.from(base64Data, 'base64'));
-        cleanupPaths.push(inputFilePath);
-    } else if (req.file) { // Handle file upload input
-        inputFilePath = req.file.path;
-        cleanupPaths.push(inputFilePath);
-    }
-
-    // --- Optimize Photo if provided ---
-    if (inputFilePath) {
-        const optimizedPhotoPath = path.join(uploadDir, `optimized-${path.basename(inputFilePath)}.jpg`);
-        cleanupPaths.push(optimizedPhotoPath);
-        await sharp(inputFilePath)
-            .resize(200, 200, { fit: 'cover' })
-            .toFormat("jpg")
-            .jpeg({ quality: 75, chromaSubsampling: "4:2:0" })
-            .toFile(optimizedPhotoPath);
-        photoBase64 = fs.readFileSync(optimizedPhotoPath).toString("base64");
-        logger(`API /api/register-user: Photo processed for PIN ${userPin}`);
-    }
-
-    // --- Add User to central 'users' DB ---
-    // It's good practice to add the user here first.
-    await addUserToUsersTable(userPin, name, req.body.email, null); // Store user centrally
-
-    // --- Prepare Device Command Strings ---
-    const commandStrings = [];
-    // Generate a unique ID part for this batch of commands (makes device log matching easier)
-    const commandIdPart = randomUUID().substring(0, 8);
-    const sanitizedName = name.replace(/[\t\n\r]/g, ' '); // Sanitize name
-    // Command to add/update user info
-    commandStrings.push(`C:${commandIdPart}01:DATA USER PIN=${userPin}\tName=${sanitizedName}\tPri=0`); // Add sequence like 01
-
-    // Command to add/update the biometric photo (if available)
-    if (photoBase64) {
-      // Calculate size from the *buffer* before base64 encoding for accuracy
-      const photoBuffer = Buffer.from(photoBase64, 'base64');
-      const photoSize = photoBuffer.length;
-      commandStrings.push(`C:${commandIdPart}02:DATA UPDATE BIOPHOTO PIN=${userPin}\tFID=1\tNo=0\tIndex=0\tType=2\tFormat=0\tSize=${photoSize}\tContent=${photoBase64}`); // Add sequence like 02
-    }
-
-    // --- Queue Commands for Devices ---
-    await addCommandsToQueue(commandStrings);
-
-    // --- Respond to API Client ---
-    logger(`API /api/register-user: Queued ${commandStrings.length} commands for PIN ${userPin}.`);
-    res.status(200).json({ message: "User registration queued.", userPin: userPin });
-
-  } catch (error) {
-    logger(`API /api/register-user: Error processing registration for PIN ${userPin}:`, error);
-    // Consider removing the user from 'users' table if queueing fails? Or handle cleanup later.
-    res.status(500).json({ error: "Failed to process registration." });
-  } finally {
-    // --- Cleanup Temporary Files ---
-    cleanupPaths.forEach(fp => fs.unlink(fp, err => {
-        if (err) logger(`Warn: Failed to delete temp file ${fp}: ${err.message}`);
-    }));
   }
 });
 
