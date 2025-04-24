@@ -102,20 +102,62 @@ function initializeDatabase() {
 function setKeyValue(key, value, userpin = null) { // Default userpin to null
   const serializedValue = JSON.stringify(value); // Convert value to JSON string
   return new Promise((resolve, reject) => {
-    db.run(
-      // Using original INSERT/UPDATE logic
-      `INSERT INTO KeyValueStore (key, value, userpin, date_created) VALUES (?, ?, ?, datetime('now'))
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, userpin = excluded.userpin, date_created = datetime('now')`,
-      [key, serializedValue, userpin], // Pass userpin
-      function (err) {
-        if (err) {
-            console.error(`Error in setKeyValue for key "${key}":`, err.message);
-            reject(err);
-        } else {
-            resolve("Key-Value pair set successfully.");
-        }
+    // Log what we're about to store
+    if (key === "commands") {
+      logger(`STORING COMMANDS: About to save ${Array.isArray(value) ? value.length : 0} commands to KeyValueStore`);
+      if (Array.isArray(value) && value.length > 0) {
+        logger(`First command: ${value[0].command.substring(0, 50)}...`);
+        logger(`Last command: ${value[value.length-1].command.substring(0, 50)}...`);
       }
-    );
+    }
+    
+    // First check if the record exists - helps with debugging
+    db.get(`SELECT key FROM KeyValueStore WHERE key = ?`, [key], (err, row) => {
+      if (err) {
+        console.error(`Error checking KeyValueStore for key "${key}":`, err.message);
+        reject(err);
+        return;
+      }
+      
+      const exists = !!row;
+      logger(`Key "${key}" ${exists ? 'exists' : 'does not exist'} in KeyValueStore`);
+      
+      // Now perform the insert/update
+      db.run(
+        // Using original INSERT/UPDATE logic
+        `INSERT INTO KeyValueStore (key, value, userpin, date_created) VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, userpin = excluded.userpin, date_created = datetime('now')`,
+        [key, serializedValue, userpin], // Pass userpin
+        function (err) {
+          if (err) {
+              console.error(`Error in setKeyValue for key "${key}":`, err.message);
+              reject(err);
+          } else {
+              logger(`Key-Value pair set successfully for key "${key}". Changes: ${this.changes}`);
+              
+              // Verify that the data was stored correctly
+              if (key === "commands") {
+                db.get(`SELECT value FROM KeyValueStore WHERE key = ?`, [key], (verifyErr, verifyRow) => {
+                  if (verifyErr) {
+                    console.error(`Error verifying storage for key "${key}":`, verifyErr.message);
+                  } else if (verifyRow) {
+                    try {
+                      const parsed = JSON.parse(verifyRow.value);
+                      logger(`Verified ${Array.isArray(parsed) ? parsed.length : 0} commands stored in KeyValueStore`);
+                    } catch (parseErr) {
+                      console.error(`Error parsing stored value for key "${key}":`, parseErr.message);
+                    }
+                  } else {
+                    console.error(`Key "${key}" not found after storage attempt`);
+                  }
+                });
+              }
+              
+              resolve("Key-Value pair set successfully.");
+          }
+        }
+      );
+    });
   });
 }
 
@@ -683,6 +725,11 @@ async function addCommandsToQueue(newCommandStrings) {
             
             // Save the updated list back to KeyValueStore, using null for userpin parameter
             await setKeyValue("commands", updatedCommands, null);
+            
+            // Verify that the commands were actually stored - crucial debug step
+            const verifyCommands = await getValueByKey("commands") || [];
+            logger(`VERIFICATION: KeyValueStore now has ${verifyCommands.length} commands after update`);
+            
             logger(`Command queue updated: Added ${commandObjectsToAdd.length} new command(s), replaced ${replacedCount} old commands. New total: ${updatedCommands.length}`);
             
             // Also log commands to commands_log table with 'pending' status for tracking
@@ -836,6 +883,10 @@ app.post("/api/register-user", upload.single("photo"), async (req, res) => {
             await addUserToUsersTable(userPin, name, req.body.email, photoBase64);
         }
 
+        // --- Check current command queue status before adding new commands ---
+        const beforeCommands = await getValueByKey("commands") || [];
+        logger(`API /api/register-user: Command queue has ${beforeCommands.length} commands before adding new ones`);
+
         // --- Prepare Device Command Strings ---
         const commandStrings = [];
         // Generate a unique ID part for this batch of commands
@@ -845,6 +896,7 @@ app.post("/api/register-user", upload.single("photo"), async (req, res) => {
         // Command to add/update user info - making sure it's distinct for this user
         const userCommand = `C:${commandIdPart}01:DATA USER PIN=${userPin}\tName=${sanitizedName}\tPri=0`;
         commandStrings.push(userCommand);
+        logger(`API /api/register-user: Created user command for PIN=${userPin}`);
 
         // Command to add/update the biometric photo (if available)
         if (photoBase64) {
@@ -853,17 +905,28 @@ app.post("/api/register-user", upload.single("photo"), async (req, res) => {
           const photoSize = photoBuffer.length;
           const photoCommand = `C:${commandIdPart}02:DATA UPDATE BIOPHOTO PIN=${userPin}\tFID=1\tNo=0\tIndex=0\tType=2\tFormat=0\tSize=${photoSize}\tContent=${photoBase64}`;
           commandStrings.push(photoCommand);
+          logger(`API /api/register-user: Created photo command for PIN=${userPin}`);
         }
 
         // --- Queue Commands for Devices ---
-        await addCommandsToQueue(commandStrings);
+        logger(`API /api/register-user: Queueing ${commandStrings.length} commands for PIN=${userPin}`);
+        const addedCommands = await addCommandsToQueue(commandStrings);
+        
+        // --- Check command queue after adding commands ---
+        const afterCommands = await getValueByKey("commands") || [];
+        logger(`API /api/register-user: Command queue now has ${afterCommands.length} commands (added ${afterCommands.length - beforeCommands.length})`);
+
+        // --- Check if our specific commands were added ---
+        const userPinCommands = afterCommands.filter(cmd => cmd.userPin === userPin);
+        logger(`API /api/register-user: Queue now has ${userPinCommands.length} commands for PIN=${userPin}`);
 
         // --- Respond to API Client ---
         logger(`API /api/register-user: Queued ${commandStrings.length} commands for PIN ${userPin}.`);
         res.status(200).json({ 
             message: userExists ? "User update queued." : "User registration queued.", 
             userPin: userPin,
-            commandCount: commandStrings.length
+            commandCount: commandStrings.length,
+            queueSize: afterCommands.length
         });
 
       } catch (error) {
